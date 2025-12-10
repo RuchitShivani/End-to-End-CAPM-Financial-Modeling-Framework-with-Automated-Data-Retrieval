@@ -1,0 +1,243 @@
+
+import sys, os, time, traceback
+from pathlib import Path
+
+try:
+    import yfinance as yf, pandas as pd, numpy as np
+    from sklearn.linear_model import LinearRegression
+    import plotly.express as px, plotly.graph_objects as go
+except Exception:
+    print("Installing required packages (this may take ~30s)...")
+    !python -m pip install --upgrade pip setuptools wheel > /dev/null
+    !pip install --quiet yfinance pandas numpy openpyxl scikit-learn plotly
+    import yfinance as yf, pandas as pd, numpy as np
+    from sklearn.linear_model import LinearRegression
+    import plotly.express as px, plotly.graph_objects as go
+
+_is_colab = False
+try:
+    from google.colab import files as colab_files, drive as colab_drive
+    _is_colab = True
+except Exception:
+    _is_colab = False
+
+print("Enter tickers as comma-separated values (examples: TSLA,AAPL,AMZN or TCS.NS,RELIANCE.NS).")
+tickers_raw = input("Tickers (comma-separated) — leave blank to use AAPL,TSLA: ").strip()
+if not tickers_raw:
+    tickers_raw = "AAPL,TSLA"
+tickers = [t.strip() for t in tickers_raw.split(",") if t.strip()]
+
+years_raw = input("Years of history to fetch (1-10) [default 2]: ").strip()
+years = int(years_raw) if years_raw.isdigit() and 1 <= int(years_raw) <= 10 else 2
+
+rf_raw = input("Risk-free rate (annual, decimal). Example 0.03 for 3% [default 0.03]: ").strip()
+try:
+    rf = float(rf_raw) if rf_raw else 0.03
+except:
+    rf = 0.03
+
+print(f"\nTickers: {tickers}\nYears: {years}\nRisk-free (ann): {rf}\n")
+
+def robust_fetch_close_series(tickers_list, years, verbose=True):
+    end = pd.Timestamp.today().normalize().date()
+    start = end - pd.Timedelta(days=365*years + 15)
+    series = {}
+    for t in tickers_list:
+        if verbose: print(f"Fetching {t} ...", end=" ")
+        try:
+            tk = yf.Ticker(t)
+            df = tk.history(start=start, end=end, auto_adjust=True)
+            if isinstance(df, pd.DataFrame) and (not df.empty) and 'Close' in df.columns:
+                series[t] = df['Close'].rename(t)
+                print(f"OK (history, {len(df)} rows)")
+                time.sleep(0.05)
+                continue
+        except Exception as e:
+            print(f"history() failed: {e}")
+        try:
+            df2 = yf.download(t, start=start, end=end, progress=False, threads=False, auto_adjust=True)
+            if isinstance(df2, pd.DataFrame) and (not df2.empty) and 'Close' in df2.columns:
+                series[t] = df2['Close'].rename(t)
+                print(f"OK (download, {len(df2)} rows)")
+                time.sleep(0.05)
+                continue
+            else:
+                print("download returned no data")
+        except Exception as e2:
+            print(f"download() failed: {e2}")
+        print(f"Skipped {t}")
+    if 'SP500' not in series:
+        try:
+            sp = yf.Ticker('^GSPC').history(start=start, end=end, auto_adjust=True)
+            if isinstance(sp, pd.DataFrame) and (not sp.empty) and 'Close' in sp.columns:
+                series['SP500'] = sp['Close'].rename('SP500')
+                print("Fetched SP500 (^GSPC) as market proxy")
+        except Exception as e:
+            print("Could not fetch ^GSPC:", e)
+    if not series:
+        raise RuntimeError("No data fetched for any ticker.")
+    prices = pd.concat(series.values(), axis=1).sort_index()
+    prices.index.name = 'Date'
+    prices = prices.dropna(how='all')
+    return prices
+
+try:
+    prices = robust_fetch_close_series(tickers, years, verbose=True)
+except Exception as e:
+    print("\nFATAL: fetch failed:", e)
+    traceback.print_exc()
+    print("\nIf you see `'str' object is not callable` or similar, restart runtime (Runtime -> Restart runtime), then re-run this cell.")
+    raise SystemExit()
+
+print("\nFetched price DataFrame info:")
+print(prices.info())
+print("\nSample rows:")
+display(prices.head())
+
+try:
+    prices.index = pd.to_datetime(prices.index).tz_localize(None)
+except Exception:
+    try:
+        prices.index = pd.to_datetime(prices.index).tz_convert(None)
+    except Exception:
+        prices.index = pd.to_datetime(prices.index)
+prices.index = prices.index.normalize()
+
+def normalize_prices(df):
+    first_vals = df.apply(lambda c: c.dropna().iloc[0] if c.dropna().size>0 else np.nan)
+    return df.divide(first_vals)
+
+norm = normalize_prices(prices)
+returns = prices.pct_change().dropna().reset_index()
+
+market_col = 'SP500' if 'SP500' in returns.columns else (returns.columns[-1] if returns.shape[1]>1 else None)
+if market_col is None:
+    print("No market proxy available. Exiting.")
+    raise SystemExit()
+
+betas, alphas, stocks_done = [], [], []
+for c in returns.columns:
+    if c in ('Date', market_col): continue
+    try:
+        X = returns[[market_col]].values
+        y = returns[[c]].values
+        m = LinearRegression().fit(X, y)
+        betas.append(float(m.coef_[0][0])); alphas.append(float(m.intercept_[0])); stocks_done.append(c)
+    except Exception as e:
+        print(f"Could not compute beta for {c}: {e}")
+
+beta_df = pd.DataFrame({'Stock': stocks_done, 'Beta': [round(x,6) for x in betas], 'Alpha': [round(x,8) for x in alphas]})
+rm_annual = returns[market_col].mean() * 252
+capm_vals = [round(rf + b * (rm_annual - rf), 6) for b in betas]
+capm_df = pd.DataFrame({'Stock': stocks_done, 'CAPM_Annual_Expected_Return': capm_vals})
+
+def detect_scale_distortion(df, threshold_ratio=10.0):
+    """Return True if one series has max range >> others (dominates chart)."""
+    ranges = df.max() - df.min()
+    ranges = ranges.dropna()
+    if len(ranges) <= 1:
+        return False
+    top = ranges.max()
+    others = ranges.drop(ranges.idxmax())
+    median_others = others.median() if len(others)>0 else 0.0
+    if median_others == 0:
+        return top > 0
+    return (top / median_others) >= threshold_ratio
+
+distorted = detect_scale_distortion(prices)
+
+try:
+    fig_raw = px.line(prices, x=prices.index, y=prices.columns, title='Price History (raw values, shared axis)')
+    fig_raw.update_layout(legend_title_text='Ticker', height=450)
+    fig_raw.show()
+except Exception as e:
+    print("Raw plot failed:", e)
+
+try:
+    fig_norm = px.line(norm, x=norm.index, y=norm.columns, title='Normalized Prices (first value = 1) — recommended for CAPM')
+    fig_norm.update_layout(legend_title_text='Ticker', height=450)
+    fig_norm.show()
+except Exception as e:
+    print("Normalized plot failed:", e)
+
+if distorted:
+    try:
+        ranges = (prices.max() - prices.min()).dropna()
+        dominant = ranges.idxmax()
+        others = [c for c in prices.columns if c != dominant]
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=prices.index, y=prices[dominant], name=str(dominant), yaxis='y1'))
+        for o in others:
+            fig2.add_trace(go.Scatter(x=prices.index, y=prices[o], name=str(o), yaxis='y2'))
+        fig2.update_layout(
+            title=f'Raw Prices with Secondary Axis (dominant: {dominant})',
+            yaxis=dict(title=f'{dominant} (left axis)'),
+            yaxis2=dict(title='Other tickers (right axis)', overlaying='y', side='right'),
+            legend=dict(x=1.02, y=1),
+            height=550
+        )
+        fig2.show()
+    except Exception as e:
+        print("Secondary-axis plot failed:", e)
+else:
+    print("No large scale distortion detected — secondary axis not necessary.")
+
+for s in stocks_done:
+    try:
+        b_idx = stocks_done.index(s)
+        b = betas[b_idx]; a = alphas[b_idx]
+        fig_s = go.Figure()
+        fig_s.add_trace(go.Scatter(x=returns[market_col], y=returns[s], mode='markers', name=f'{s}'))
+        xs = np.linspace(returns[market_col].min(), returns[market_col].max(), 200)
+        ys = a + b * xs
+        fig_s.add_trace(go.Scatter(x=xs, y=ys, mode='lines', name=f'Fit (beta={b:.2f})'))
+        fig_s.update_layout(title=f'{s} Daily Returns vs {market_col} Daily Returns', xaxis_title=f'{market_col} Return', yaxis_title=f'{s} Return', height=450)
+        fig_s.show()
+    except Exception as e:
+        print(f"Scatter plot for {s} failed:", e)
+
+OUT = "capm_output.xlsx"
+try:
+    with pd.ExcelWriter(OUT, engine='openpyxl') as w:
+        prices.to_excel(w, sheet_name='Prices')
+        norm.to_excel(w, sheet_name='Normalized_Prices')
+        returns.to_excel(w, sheet_name='Daily_Returns', index=False)
+        beta_df.to_excel(w, sheet_name='Beta_Alpha', index=False)
+        capm_df.to_excel(w, sheet_name='CAPM_Returns', index=False)
+    size_bytes = Path(OUT).stat().st_size
+    print(f"\nWrote Excel: {OUT}  size={size_bytes} bytes")
+except Exception as e:
+    print("Failed to write Excel:", e)
+    traceback.print_exc()
+    raise SystemExit()
+
+if _is_colab:
+    try:
+        print("Attempting to download via google.colab.files.download() ...")
+        colab_files.download(OUT)
+        print("files.download() called — check your browser download bar.")
+    except Exception as e:
+        print("files.download() failed:", e)
+        try:
+            print("Attempting to copy to Google Drive (/content/drive/MyDrive/)...")
+            colab_drive.mount('/content/drive', force_remount=False)
+            target = f"/content/drive/MyDrive/{OUT}"
+            import shutil
+            shutil.copy(OUT, target)
+            print(f"Copied to Google Drive at: {target}")
+        except Exception as e2:
+            print("Drive copy failed:", e2)
+            try:
+                ZIP = "capm_output.zip"
+                import zipfile
+                with zipfile.ZipFile(ZIP, 'w', zipfile.ZIP_DEFLATED) as z:
+                    z.write(OUT)
+                print("Attempting to download zip fallback...")
+                colab_files.download(ZIP)
+            except Exception as e3:
+                print("Zip download fallback failed:", e3)
+else:
+    print(f"Not in Colab. Excel written to working directory: {os.getcwd()}/{OUT}")
+
+print("\nDone. If download did not appear, copy & paste the exact text output above (everything printed by this cell) and I will fix the single remaining line causing failure.")
